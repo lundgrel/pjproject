@@ -111,7 +111,7 @@ $(SAMPLES): $(SRCDIR)\$(@B).c $(LIBS) $(SRCDIR)\util.h Samples-vc.mak
 	cl /nologo $(OBJDIR)\$(@B).obj /Fe$@ /Fm$(OBJDIR)\$(@B).map $(LDFLAGS)
 	@rem the following two lines is just for cleaning up the 'bin' directory
 	if exist $(BINDIR)\*.ilk del /Q $(BINDIR)\*.ilk
-	if exist $(BINDIR)\*.pdb del /Q $(BINDIR)\*.pdb
+	@rem no DETELE if exist $(BINDIR)\*.pdb del /Q $(BINDIR)\*.pdb
 
 $(BINDIR):
 	if not exist $(BINDIR) mkdir $(BINDIR)

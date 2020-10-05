@@ -298,17 +298,18 @@ PJ_DEF(pj_status_t) pjmedia_codec_mgr_get_codec_info( pjmedia_codec_mgr *mgr,
 
     pj_mutex_lock(mgr->mutex);
 
-    for (i=0; i<mgr->codec_cnt; ++i) {
-	if (mgr->codec_desc[i].info.pt == pt) {
-	    *p_info = &mgr->codec_desc[i].info;
+    for (i = 0; i < mgr->codec_cnt; ++i) {
+        if (mgr->codec_desc[i].info.pt == pt) {
+            *p_info = &mgr->codec_desc[i].info;
 
-	    pj_mutex_unlock(mgr->mutex);
-	    return PJ_SUCCESS;
-	}
+            pj_mutex_unlock(mgr->mutex);
+            return PJ_SUCCESS;
+        }
     }
 
     pj_mutex_unlock(mgr->mutex);
 
+    printf("Unsupported coded %d", (int)pt);
     return PJMEDIA_CODEC_EUNSUP;
 }
 

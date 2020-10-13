@@ -50,6 +50,7 @@ static const char* USAGE =
 "  --dst-ip=IP            Only include packets destined to this address\n"
 "  --src-port=port        Only include packets from this source port number\n"
 "  --dst-port=port        Only include packets destined to this port number\n"
+"  --ssrc=SSRC            Only include packets with this SSRC (0xHEX or just 1234)\n"
 "\n"
 "Options for RTP packet processing:\n"
 ""
@@ -87,6 +88,11 @@ static struct app
 	pjmedia_transport* srtp;
 	pjmedia_rtp_session	 rtp_sess;
 	pj_bool_t		 rtp_sess_init;
+	/**
+	* Specify ssrc. Useful as filter.
+	* Note that the port number must be in network byte order.
+	*/
+	pj_uint32_t filter_ssrc;
 } app;
 
 
@@ -129,7 +135,7 @@ static void err_exit(const char* title, pj_status_t status)
 		pj_strerror(status, errmsg, sizeof(errmsg));
 		printf("Error: %s: %s\n", title, errmsg);
 	}
-	else {
+	else if ( title != NULL && *title != '\0' ) {
 		printf("Error: %s\n", title);
 	}
 	cleanup();
@@ -141,6 +147,54 @@ static void err_exit(const char* title, pj_status_t status)
 			if (status != PJ_SUCCESS) \
     			    err_exit(#op, status); \
 		    } while (0)
+
+
+static int isEndOfEvent(const pj_uint8_t* payload)
+{
+	char event = payload[1];
+	return (event & 0x80u) != 0;
+}
+
+/**
+	Retrieves the volume in DBm0.
+	0 is highest volume.
+	-36 dBm0
+*/
+static double getVolumedBm0(const pj_uint8_t* payload)
+{
+	char event = payload[1];
+	return -(event & 0x3F);
+}
+
+/**
+	decodes the event as DTMF
+*/
+static char getDTMF(const pj_uint8_t* payload)
+{
+	char et = payload[0];
+	if (0 <= et && et <= 9)
+		return '0' + et;
+	else if (et == 10)
+		return '*';
+	else if (et == 11)
+		return '#';
+	else if (12 <= et && et <= 15)
+		return 'A' + et - 12;
+	else if (et == 16)
+		return 'F'; // flash
+	else 
+		return '?';
+}
+
+/**
+	gets duration in timestamp units
+*/
+static unsigned short getDuration(const pj_uint8_t* payload)
+{
+	unsigned short* v = (unsigned short*)(payload+2);
+	return ntohs(*v);
+}
+
 
 
 static pj_status_t read_rtp(pj_uint8_t* buf, pj_size_t bufsize,
@@ -212,6 +266,11 @@ static pj_status_t read_rtp(pj_uint8_t* buf, pj_size_t bufsize,
 
 		/* Update RTP session */
 		pjmedia_rtp_session_update2(&app.rtp_sess, r, &seq_st, PJ_FALSE);
+
+		if (app.filter_ssrc != 0 && app.filter_ssrc != r->ssrc) {
+			/* skip wrong ssrc */
+			continue;
+		}
 
 		/* Skip out-of-order packet */
 		if (seq_st.diff == 0) {
@@ -442,19 +501,31 @@ static void pcap2wav(const pj_str_t* codec,
 
 static void print_packet(FILE* out, unsigned pkt_count, pjmedia_rtp_hdr* rtp, pj_uint8_t* payload, unsigned payload_len)
 {
-	fprintf(out, "Packet %u seq:%d ts:%d pt:%d %sSSRC:0x%08x len:%d\n",
+	fprintf(out, "Packet %u seq:%u ts:%u pt:%hu %sSSRC:0x%08x len:%d\n",
 		pkt_count,
-		(int)rtp->seq,
-		(int)rtp->ts,
-		(int)rtp->pt,
+		rtp->seq,
+		rtp->ts,
+		rtp->pt,
 		(rtp->m != 0 ? "marked " : ""),
 		rtp->ssrc,
 		payload_len);
-	
-	for (unsigned c = 0; c < 100 && c < payload_len; ++c)
-		fprintf(out, "%02x", (int)payload[c]);
-	if (payload_len >= 100)
-		fprintf(out, "...");
+
+	if ( payload_len == 4 ) { // assume DTMF
+		char dtmf = getDTMF(payload);
+		pj_bool_t eod = isEndOfEvent(payload);
+		fprintf(out, "DTMF %c %sdur:%d vol:%fdB\n"
+			, dtmf
+			, (eod?"end ":"")
+			, getDuration(payload)
+			, getVolumedBm0(payload)
+		);
+	}
+	else {
+		for (unsigned c = 0; c < 100 && c < payload_len; ++c)
+			fprintf(out, "%02x", (int)payload[c]);
+		if (payload_len >= 100)
+			fprintf(out, "...");
+	}
 	fprintf(out, "\n");
 }
 
@@ -484,7 +555,11 @@ static void pcap2txt(
 		f_out = fopen(output_filename->ptr, "w");
 		if (f_out == NULL)
 		{
-			err_exit(strerror(errno), PJ_FALSE);
+			fprintf(stderr, "Failed to open file \"%s\" for writing: %d %s\n",
+				output_filename->ptr,
+				(errno),
+				strerror(errno));
+			err_exit(NULL, PJ_SUCCESS); // I have already logged error
 		}
 	}
 
@@ -575,6 +650,20 @@ static void pcap2pcap(
 
 }
 
+static pj_bool_t parse_int_hex_or_num(const char* s, pj_uint32_t* target)
+{	
+	if (sscanf(s, "0x%x", target) == 1)
+		return PJ_TRUE;
+
+	// if hex, force hex parse
+	for (const char* s1 = s; *s1 != '\0'; ++s1)
+		if ('a' <= *s1 && *s1 <= 'f' || 'A' <= *s1 && *s1 <= 'F')
+			return (sscanf(s, "%x", target) == 1);
+
+	// then must be numbers
+	return (sscanf(s, "%d", target) == 1);
+}
+
 int main(int argc, char* argv[])
 {
 	pj_str_t input, output, srtp_crypto, srtp_key, codec;
@@ -583,7 +672,7 @@ int main(int argc, char* argv[])
 	pj_status_t status;
 
 	enum {
-		OPT_SRC_IP = 1, OPT_DST_IP, OPT_SRC_PORT, OPT_DST_PORT,
+		OPT_SRC_IP = 1, OPT_DST_IP, OPT_SRC_PORT, OPT_DST_PORT, OPT_SSRC,
 		OPT_CODEC, OPT_PLAY_DEV_ID
 	};
 	enum {
@@ -598,6 +687,7 @@ int main(int argc, char* argv[])
 	{ "dst-ip",	    1, 0, OPT_DST_IP },
 	{ "src-port",	    1, 0, OPT_SRC_PORT },
 	{ "dst-port",	    1, 0, OPT_DST_PORT },
+	{ "ssrc",	    1, 0, OPT_SSRC},
 	{ "codec",	    1, 0, OPT_CODEC },
 	{ "play-dev-id",    1, 0, OPT_PLAY_DEV_ID },
 	{ "out-format",    1, 0, 'f' },
@@ -614,6 +704,8 @@ int main(int argc, char* argv[])
 	filter.link = PJ_PCAP_LINK_TYPE_ETH;
 	filter.proto = PJ_PCAP_PROTO_TYPE_UDP;
 
+	app.filter_ssrc = 0;
+	
 	/* Parse arguments */
 	pj_optind = 0;
 	while ((c = pj_getopt_long(argc, argv, "c:k:f:", long_options, &option_index)) != -1) {
@@ -674,6 +766,18 @@ int main(int argc, char* argv[])
 		case OPT_DST_PORT:
 			filter.dst_port = pj_htons((pj_uint16_t)atoi(pj_optarg));
 			break;
+		case OPT_SSRC:
+		{
+			pj_uint32_t ssrc;
+			if (parse_int_hex_or_num(pj_optarg, &ssrc))
+				app.filter_ssrc = pj_htonl(ssrc);
+			else {
+				puts(USAGE);
+				puts("Failed to parse ssrc-argument\n");
+				return 1;
+			}
+		}
+		break;
 		case OPT_CODEC:
 			codec = pj_str(pj_optarg);
 			break;
@@ -717,7 +821,12 @@ int main(int argc, char* argv[])
 	T(pjlib_util_init());
 	T(pjmedia_endpt_create(&app.cp.factory, NULL, 0, &app.mept));
 
-	T(pj_pcap_open(app.pool, input.ptr, &app.pcap));
+	status = pj_pcap_open(app.pool, input.ptr, &app.pcap);
+	if (status != PJ_SUCCESS) {
+		fprintf(stderr, "Failed to open %s.", input.ptr);
+		err_exit(NULL, status);
+	}
+
 	T(pj_pcap_set_filter(app.pcap, &filter));
 
 	switch (output_format)
